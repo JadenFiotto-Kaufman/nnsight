@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterator, List, Optional, Union
 
 import torch
 from torch._guards import detect_fake_mode
+from torch._dynamo.eval_frame import OptimizedModule
 
 from .contexts.Tracer import Tracer
 from .intervention import InterventionProxy
@@ -24,7 +25,7 @@ class Envoy:
         _tracer (nnsight.context.Tracer.Tracer): Object which adds this Envoy's module's output and input proxies to an intervention graph. Must be set on Envoys objects manually by the Tracer.
     """
 
-    def __init__(self, module: torch.nn.Module, module_path: str = ""):
+    def __init__(self, module: torch.nn.Module, attr_map: dict = {}, module_path: str = ""):
 
         self._module_path = module_path
 
@@ -39,6 +40,8 @@ class Envoy:
         self._tracer: Tracer = None
 
         self._module = module
+        self._attr_map = attr_map
+                
         self._sub_envoys: List[Envoy] = []
 
         # Register hook on underlying module to update the _fake_outputs and _fake_inputs on forward pass.
@@ -49,14 +52,14 @@ class Envoy:
         if isinstance(module, torch.nn.ModuleList):
             for i, module in enumerate(self._module):
 
-                envoy = Envoy(module, module_path=f"{self._module_path}.{i}")
+                envoy = Envoy(module, attr_map = self._attr_map, module_path=f"{self._module_path}.{i}")
 
                 self._sub_envoys.append(envoy)
 
         else:
             for name, module in self._module.named_children():
 
-                envoy = Envoy(module, module_path=f"{self._module_path}.{name}")
+                envoy = Envoy(module, attr_map = self._attr_map, module_path=f"{self._module_path}.{name}")
 
                 self._sub_envoys.append(envoy)
 
@@ -66,8 +69,13 @@ class Envoy:
 
                     self._handle_overloaded_mount(envoy, name)
 
-                else:
+                # Change the attribute to the name in the attr_map if it exists.
+                elif name in self._attr_map:
 
+                    setattr(self, self._attr_map[name], envoy)
+                
+                else:
+                    
                     setattr(self, name, envoy)
 
     def _handle_overloaded_mount(self, envoy: Envoy, mount_point: str):
@@ -100,6 +108,18 @@ class Envoy:
         # Update the class on the instance
         self.__class__ = new_cls
 
+    def fold(self, module, propagate=True):
+
+        for env in self._sub_envoys:
+            if hasattr(env, module):
+                mod_name = env._module_path.split(".")[-1]
+                mod = getattr(env, module)
+                setattr(self, mod_name, mod)
+
+        if propagate:
+            for envoy in self._sub_envoys:
+                envoy.fold(module, propagate=True)
+
     def _set_tracer(self, tracer: Tracer, propagate=True):
         """Set tracer object on Envoy.
 
@@ -113,6 +133,34 @@ class Envoy:
         if propagate:
             for envoy in self._sub_envoys:
                 envoy._set_tracer(tracer, propagate=True)
+
+    def clear_hooks(self, propagate: bool = True) -> None:
+        """Clears hooks on all sub-modules.
+
+        Args:
+            propagate (bool, optional): If to propagate to all sub-modules. Defaults to True.
+        """
+
+        self._hook_handle.remove()
+
+        if propagate:
+            for envoy in self._sub_envoys:
+                envoy.clear_hooks(propagate=True)
+
+    def set_hooks(self, propagate: bool = True) -> None:
+        """Sets hooks on all sub-modules.
+
+        Args:
+            propagate (bool, optional): If to propagate to all sub-modules. Defaults to True.
+        """
+
+        self._hook_handle = self._module.register_forward_hook(
+            self._hook, with_kwargs=True
+        )
+
+        if propagate:
+            for envoy in self._sub_envoys:
+                envoy.set_hooks(propagate=True)
 
     def _reset_proxies(self, propagate: bool = True) -> None:
         """Sets proxies to None.
@@ -184,6 +232,46 @@ class Envoy:
 
         return self
 
+    def __repr__(self) -> str:
+        """Wrapper method for underlying module's string representation.
+
+        Returns:
+            str: String.
+        """
+
+        if isinstance(self._module, torch.nn.ModuleList):
+
+            return self._repr_module_list()
+
+        extra_lines = []
+        extra_repr = self._module.extra_repr()
+        # empty string will be split into list ['']
+        if extra_repr:
+            extra_lines = extra_repr.split("\n")
+        child_lines = []
+        for attribute_name, attribute in self.__dict__.items():
+            attribute_name = self._attr_map.get(attribute_name, attribute_name)
+            if isinstance(attribute, Envoy):
+                mod_str = repr(attribute)
+                # Skip showing _orig_mod if it's an OptimizedModule
+                if type(attribute._module) == OptimizedModule:
+                    mod_str = repr(attribute._orig_mod) 
+                mod_str = torch.nn.modules.module._addindent(mod_str, 2)
+                child_lines.append("(" + attribute_name + "): " + mod_str)
+        lines = extra_lines + child_lines
+
+        main_str = self._module._get_name() + "("
+        if lines:
+            # simple one-liner info, which most builtin Modules will use
+            if len(extra_lines) == 1 and not child_lines:
+                main_str += extra_lines[0]
+            else:
+                main_str += "\n  " + "\n  ".join(lines) + "\n"
+
+        main_str += ")"
+
+        return main_str
+
     def _repr_module_list(self):
 
         list_of_reprs = [repr(item) for item in self._sub_envoys]
@@ -215,53 +303,14 @@ class Envoy:
         main_str += "\n  " + "\n  ".join(lines) + "\n"
         main_str += ")"
         return main_str
-
-    def __repr__(self) -> str:
-        """Wrapper method for underlying module's string representation.
-
-        Returns:
-            str: String.
-        """
-
-        if isinstance(self._module, torch.nn.ModuleList):
-
-            return self._repr_module_list()
-
-        extra_lines = []
-        extra_repr = self._module.extra_repr()
-        # empty string will be split into list ['']
-        if extra_repr:
-            extra_lines = extra_repr.split("\n")
-        child_lines = []
-        for attribute_name, attribute in self.__dict__.items():
-
-            if isinstance(attribute, Envoy):
-
-                mod_str = repr(attribute)
-                mod_str = torch.nn.modules.module._addindent(mod_str, 2)
-                child_lines.append("(" + attribute_name + "): " + mod_str)
-                
-        lines = extra_lines + child_lines
-
-        main_str = self._module._get_name() + "("
-        if lines:
-            # simple one-liner info, which most builtin Modules will use
-            if len(extra_lines) == 1 and not child_lines:
-                main_str += extra_lines[0]
-            else:
-                main_str += "\n  " + "\n  ".join(lines) + "\n"
-
-        main_str += ")"
-
-        return main_str
-
+    
     def __iter__(self) -> Iterator[Envoy]:
         """Wrapper method for underlying ModuleList iterator.
 
         Returns:
             Iterator[Envoy]: Iterator.
         """
-
+        
         return iter(self._sub_envoys)
 
     def __getitem__(self, key: int) -> Envoy:
@@ -273,7 +322,6 @@ class Envoy:
         Returns:
             Envoy: Envoy.
         """
-
         return self._sub_envoys[key]
 
     def __len__(self) -> int:
@@ -294,7 +342,6 @@ class Envoy:
         Returns:
             Any: Attribute.
         """
-
         return getattr(self._module, key)
 
     def __call__(self, *args: List[Any], **kwargs: Dict[str, Any]) -> InterventionProxy:
